@@ -1,0 +1,10 @@
+dist/
+*.log
+.env
+.DS_Store
+
+backend/.data/
+backend/.tsnet/
+backend/timmyd
+
+cli/timmy
