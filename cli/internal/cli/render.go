@@ -27,23 +27,53 @@ func (a *App) renderServers(servers []client.Server) error {
 		return err
 	}
 
-	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "ID\tNAME\tTAILSCALE IP\tSSH USER\tTAGS"); err != nil {
-		return err
-	}
-	for _, server := range servers {
-		if _, err := fmt.Fprintf(
-			tw,
-			"%d\t%s\t%s\t%s\t%s\n",
-			server.ID,
-			server.Name,
-			server.TailscaleIP,
-			server.SSHUser,
-			strings.Join(server.Tags, ","),
-		); err != nil {
-			return err
+	showSource := false
+	for _, s := range servers {
+		if s.Source != "" {
+			showSource = true
+			break
 		}
 	}
+
+	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
+
+	if showSource {
+		if _, err := fmt.Fprintln(tw, "SERVER\tID\tNAME\tTAILSCALE IP\tSSH USER\tTAGS"); err != nil {
+			return err
+		}
+		for _, server := range servers {
+			if _, err := fmt.Fprintf(
+				tw,
+				"%s\t%d\t%s\t%s\t%s\t%s\n",
+				server.Source,
+				server.ID,
+				server.Name,
+				server.TailscaleIP,
+				server.SSHUser,
+				strings.Join(server.Tags, ","),
+			); err != nil {
+				return err
+			}
+		}
+	} else {
+		if _, err := fmt.Fprintln(tw, "ID\tNAME\tTAILSCALE IP\tSSH USER\tTAGS"); err != nil {
+			return err
+		}
+		for _, server := range servers {
+			if _, err := fmt.Fprintf(
+				tw,
+				"%d\t%s\t%s\t%s\t%s\n",
+				server.ID,
+				server.Name,
+				server.TailscaleIP,
+				server.SSHUser,
+				strings.Join(server.Tags, ","),
+			); err != nil {
+				return err
+			}
+		}
+	}
+
 	return tw.Flush()
 }
 

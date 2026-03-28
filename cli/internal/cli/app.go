@@ -22,7 +22,13 @@ type App struct {
 	stderr     io.Writer
 	httpClient *http.Client
 
-	lazyClient client.Service
+	lazyClient       client.Service
+	allClientsOverride []namedClient // testing only: overrides allClients()
+}
+
+type namedClient struct {
+	name string
+	svc  client.Service
 }
 
 func New(sshRunner ssh.Runner, httpClient *http.Client, stdout, stderr io.Writer) *App {
@@ -55,33 +61,47 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	case "help", "-h", "--help":
 		a.printUsage()
 		return nil
-	}
 
-	svc, err := a.getClient()
-	if err != nil {
-		return err
-	}
+	// Fan-out: query all configured servers
+	case "ls", "list":
+		return a.runList(ctx, args[1:])
+	case "search":
+		return a.runSearch(ctx, args[1:])
+	case "ssh":
+		return a.runSSH(ctx, args[1:])
 
-	switch args[0] {
+	// Active server only
 	case "me":
+		svc, err := a.getClient()
+		if err != nil {
+			return err
+		}
 		return a.runMe(ctx, svc, args[1:])
 	case "add":
+		svc, err := a.getClient()
+		if err != nil {
+			return err
+		}
 		return a.runAdd(ctx, svc, args[1:])
-	case "ls", "list":
-		return a.runList(ctx, svc, args[1:])
-	case "search":
-		return a.runSearch(ctx, svc, args[1:])
-	case "ssh":
-		return a.runSSH(ctx, svc, args[1:])
 	case "update":
+		svc, err := a.getClient()
+		if err != nil {
+			return err
+		}
 		return a.runUpdate(ctx, svc, args[1:])
 	case "rm", "delete", "remove":
+		svc, err := a.getClient()
+		if err != nil {
+			return err
+		}
 		return a.runRemove(ctx, svc, args[1:])
 	default:
 		a.printUsage()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
+
+// ---------- client resolution ----------
 
 func (a *App) getClient() (client.Service, error) {
 	if a.lazyClient != nil {
@@ -101,7 +121,100 @@ func (a *App) getClient() (client.Service, error) {
 	return c, nil
 }
 
-// --- init / servers / use / uninit ---
+func (a *App) allClients() ([]namedClient, error) {
+	if a.allClientsOverride != nil {
+		return a.allClientsOverride, nil
+	}
+	if a.lazyClient != nil {
+		return []namedClient{{name: "", svc: a.lazyClient}}, nil
+	}
+
+	store, err := config.LoadStore()
+	if err != nil {
+		return nil, err
+	}
+	if len(store.Servers) == 0 {
+		return nil, errors.New("timmy is not initialized -- run: timmy init <server-url>")
+	}
+
+	out := make([]namedClient, 0, len(store.Servers))
+	for _, entry := range store.Servers {
+		c, err := client.NewHTTPClient(entry.URL, a.httpClient)
+		if err != nil {
+			return nil, fmt.Errorf("server %s: %w", entry.Name, err)
+		}
+		out = append(out, namedClient{name: entry.Name, svc: c})
+	}
+	return out, nil
+}
+
+// ---------- fan-out helpers ----------
+
+type fanOutResult struct {
+	servers []client.Server
+	source  string
+	err     error
+}
+
+func (a *App) fanOutList(ctx context.Context, tags []string) ([]client.Server, error) {
+	clients, err := a.allClients()
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan fanOutResult, len(clients))
+	for _, nc := range clients {
+		go func(nc namedClient) {
+			servers, err := nc.svc.ListServers(ctx, tags)
+			ch <- fanOutResult{servers: servers, source: nc.name, err: err}
+		}(nc)
+	}
+	return a.collectFanOut(ch, len(clients))
+}
+
+func (a *App) fanOutSearch(ctx context.Context, query string, tags []string, limit int) ([]client.Server, error) {
+	clients, err := a.allClients()
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan fanOutResult, len(clients))
+	for _, nc := range clients {
+		go func(nc namedClient) {
+			servers, err := nc.svc.SearchServers(ctx, query, tags, limit)
+			ch <- fanOutResult{servers: servers, source: nc.name, err: err}
+		}(nc)
+	}
+	return a.collectFanOut(ch, len(clients))
+}
+
+func (a *App) collectFanOut(ch <-chan fanOutResult, count int) ([]client.Server, error) {
+	var all []client.Server
+	var errs []string
+	for n := 0; n < count; n++ {
+		r := <-ch
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.source, r.err))
+			continue
+		}
+		for j := range r.servers {
+			r.servers[j].Source = r.source
+		}
+		all = append(all, r.servers...)
+	}
+
+	for _, e := range errs {
+		_, _ = fmt.Fprintf(a.stderr, "warning: %s\n", e)
+	}
+
+	if len(all) == 0 && len(errs) > 0 {
+		return nil, fmt.Errorf("all servers unreachable")
+	}
+
+	return all, nil
+}
+
+// ---------- init / servers / use / uninit ----------
 
 func (a *App) runInit(args []string) error {
 	fs := a.newFlagSet("init")
@@ -173,7 +286,89 @@ func (a *App) runUninit(args []string) error {
 	return nil
 }
 
-// --- commands that require an active server ---
+// ---------- fan-out commands ----------
+
+func (a *App) runList(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("ls")
+	var (
+		tags    stringSliceFlag
+		jsonOut bool
+	)
+	fs.Var(&tags, "tag", "filter by tag (repeatable)")
+	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("ls does not accept positional arguments")
+	}
+
+	servers, err := a.fanOutList(ctx, tags.Values())
+	if err != nil {
+		return err
+	}
+
+	if jsonOut {
+		return a.writeJSON(map[string]any{"servers": servers})
+	}
+	return a.renderServers(servers)
+}
+
+func (a *App) runSearch(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("search")
+	var (
+		tags    stringSliceFlag
+		jsonOut bool
+		limit   int
+	)
+	fs.Var(&tags, "tag", "filter by tag (repeatable)")
+	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
+	fs.IntVar(&limit, "limit", 50, "maximum servers to return")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("search requires a single query argument")
+	}
+
+	servers, err := a.fanOutSearch(ctx, fs.Arg(0), tags.Values(), limit)
+	if err != nil {
+		return err
+	}
+
+	if jsonOut {
+		return a.writeJSON(map[string]any{
+			"query":   fs.Arg(0),
+			"servers": servers,
+		})
+	}
+	return a.renderServers(servers)
+}
+
+func (a *App) runSSH(ctx context.Context, args []string) error {
+	fs := a.newFlagSet("ssh")
+	var (
+		exact bool
+		first bool
+	)
+	fs.BoolVar(&exact, "exact", false, "require an exact server match")
+	fs.BoolVar(&first, "first", false, "connect to the first fuzzy match")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("ssh requires a single query argument")
+	}
+
+	server, err := a.resolveServerQueryAll(ctx, fs.Arg(0), exact, first)
+	if err != nil {
+		return err
+	}
+
+	return a.sshRunner.Run(ctx, fmt.Sprintf("%s@%s", server.SSHUser, server.TailscaleIP))
+}
+
+// ---------- active-server commands ----------
 
 func (a *App) runMe(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("me")
@@ -230,86 +425,6 @@ func (a *App) runAdd(ctx context.Context, svc client.Service, args []string) err
 		return a.writeJSON(server)
 	}
 	return a.renderServers([]client.Server{server})
-}
-
-func (a *App) runList(ctx context.Context, svc client.Service, args []string) error {
-	fs := a.newFlagSet("ls")
-	var (
-		tags    stringSliceFlag
-		jsonOut bool
-	)
-	fs.Var(&tags, "tag", "filter by tag (repeatable)")
-	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 0 {
-		return errors.New("ls does not accept positional arguments")
-	}
-
-	servers, err := svc.ListServers(ctx, tags.Values())
-	if err != nil {
-		return err
-	}
-
-	if jsonOut {
-		return a.writeJSON(map[string]any{"servers": servers})
-	}
-	return a.renderServers(servers)
-}
-
-func (a *App) runSearch(ctx context.Context, svc client.Service, args []string) error {
-	fs := a.newFlagSet("search")
-	var (
-		tags    stringSliceFlag
-		jsonOut bool
-		limit   int
-	)
-	fs.Var(&tags, "tag", "filter by tag (repeatable)")
-	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
-	fs.IntVar(&limit, "limit", 50, "maximum servers to return")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 1 {
-		return errors.New("search requires a single query argument")
-	}
-
-	servers, err := svc.SearchServers(ctx, fs.Arg(0), tags.Values(), limit)
-	if err != nil {
-		return err
-	}
-
-	if jsonOut {
-		return a.writeJSON(map[string]any{
-			"query":   fs.Arg(0),
-			"servers": servers,
-		})
-	}
-	return a.renderServers(servers)
-}
-
-func (a *App) runSSH(ctx context.Context, svc client.Service, args []string) error {
-	fs := a.newFlagSet("ssh")
-	var (
-		exact bool
-		first bool
-	)
-	fs.BoolVar(&exact, "exact", false, "require an exact server match")
-	fs.BoolVar(&first, "first", false, "connect to the first fuzzy match")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 1 {
-		return errors.New("ssh requires a single query argument")
-	}
-
-	server, err := a.resolveServerQuery(ctx, svc, fs.Arg(0), exact, first)
-	if err != nil {
-		return err
-	}
-
-	return a.sshRunner.Run(ctx, fmt.Sprintf("%s@%s", server.SSHUser, server.TailscaleIP))
 }
 
 func (a *App) runUpdate(ctx context.Context, svc client.Service, args []string) error {
@@ -401,8 +516,9 @@ func (a *App) runRemove(ctx context.Context, svc client.Service, args []string) 
 	return err
 }
 
-// --- helpers ---
+// ---------- server resolution ----------
 
+// resolveServerQuery resolves a query against a single backend.
 func (a *App) resolveServerQuery(ctx context.Context, svc client.Service, query string, exactOnly, allowFirst bool) (client.Server, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -426,6 +542,24 @@ func (a *App) resolveServerQuery(ctx context.Context, svc client.Service, query 
 	if err != nil {
 		return client.Server{}, err
 	}
+	return resolveFromCandidates(query, servers, exactOnly, allowFirst)
+}
+
+// resolveServerQueryAll fans out search across all backends then resolves.
+func (a *App) resolveServerQueryAll(ctx context.Context, query string, exactOnly, allowFirst bool) (client.Server, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return client.Server{}, errors.New("query cannot be empty")
+	}
+
+	servers, err := a.fanOutSearch(ctx, query, nil, 25)
+	if err != nil {
+		return client.Server{}, err
+	}
+	return resolveFromCandidates(query, servers, exactOnly, allowFirst)
+}
+
+func resolveFromCandidates(query string, servers []client.Server, exactOnly, allowFirst bool) (client.Server, error) {
 	if len(servers) == 0 {
 		return client.Server{}, fmt.Errorf("no servers matched %q", query)
 	}
@@ -491,6 +625,8 @@ func exactServerMatchKind(query string, server client.Server) exactMatchKind {
 	return exactMatchNone
 }
 
+// ---------- utilities ----------
+
 func (a *App) newFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
@@ -504,13 +640,13 @@ func (a *App) printUsage() {
   timmy use <server-name>                 Switch active server
   timmy uninit <server-name>              Remove a server
 
-  timmy me [--json]
-  timmy add --name NAME --ip TAILSCALE_IP [--user root] [--tag TAG]... [--json]
-  timmy ls [--tag TAG]... [--json]
-  timmy search QUERY [--tag TAG]... [--limit N] [--json]
-  timmy ssh QUERY [--exact] [--first]
-  timmy update <id|query> [--name NAME] [--ip TAILSCALE_IP] [--user USER] [--tag TAG]... [--clear-tags] [--json]
-  timmy rm <id|query> [--json]`)
+  timmy me [--json]                                           (active server)
+  timmy add --name NAME --ip IP [--user root] [--tag T]...    (active server)
+  timmy ls [--tag TAG]... [--json]                            (all servers)
+  timmy search QUERY [--tag TAG]... [--limit N] [--json]      (all servers)
+  timmy ssh QUERY [--exact] [--first]                         (all servers)
+  timmy update <id|query> [--name N] [--ip I] [--tag T]...    (active server)
+  timmy rm <id|query> [--json]                                (active server)`)
 }
 
 func ptr[T any](value T) *T {
