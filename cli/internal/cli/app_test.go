@@ -9,6 +9,13 @@ import (
 	"timmy/cli/internal/client"
 )
 
+func newTestApp(svc client.Service, runner *fakeSSHRunner) (*App, *bytes.Buffer, *bytes.Buffer) {
+	var stdout, stderr bytes.Buffer
+	app := New(runner, nil, &stdout, &stderr)
+	app.lazyClient = svc
+	return app, &stdout, &stderr
+}
+
 func TestRunListJSONOutput(t *testing.T) {
 	service := &fakeClient{
 		listServers: []client.Server{
@@ -16,9 +23,7 @@ func TestRunListJSONOutput(t *testing.T) {
 		},
 	}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	app := New(service, &fakeSSHRunner{}, &stdout, &stderr)
+	app, stdout, _ := newTestApp(service, &fakeSSHRunner{})
 
 	if err := app.Run(context.Background(), []string{"ls", "--json"}); err != nil {
 		t.Fatalf("run ls --json: %v", err)
@@ -38,8 +43,8 @@ func TestResolveServerQueryPrefersExactMatch(t *testing.T) {
 		},
 	}
 
-	app := New(service, &fakeSSHRunner{}, &bytes.Buffer{}, &bytes.Buffer{})
-	server, err := app.resolveServerQuery(context.Background(), "prod", false, false)
+	app, _, _ := newTestApp(service, &fakeSSHRunner{})
+	server, err := app.resolveServerQuery(context.Background(), service, "prod", false, false)
 	if err != nil {
 		t.Fatalf("resolve query: %v", err)
 	}
@@ -56,7 +61,7 @@ func TestRunSSHBuildsOpenSSHDestination(t *testing.T) {
 	}
 	runner := &fakeSSHRunner{}
 
-	app := New(service, runner, &bytes.Buffer{}, &bytes.Buffer{})
+	app, _, _ := newTestApp(service, runner)
 	if err := app.Run(context.Background(), []string{"ssh", "prod-db-1"}); err != nil {
 		t.Fatalf("run ssh: %v", err)
 	}

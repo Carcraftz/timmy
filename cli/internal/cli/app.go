@@ -6,26 +6,34 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"timmy/cli/internal/client"
+	"timmy/cli/internal/config"
 	"timmy/cli/internal/ssh"
 )
 
 type App struct {
-	client client.Service
-	ssh    ssh.Runner
-	stdout io.Writer
-	stderr io.Writer
+	sshRunner  ssh.Runner
+	stdout     io.Writer
+	stderr     io.Writer
+	httpClient *http.Client
+
+	lazyClient client.Service
 }
 
-func New(service client.Service, sshRunner ssh.Runner, stdout, stderr io.Writer) *App {
+func New(sshRunner ssh.Runner, httpClient *http.Client, stdout, stderr io.Writer) *App {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 10 * time.Second}
+	}
 	return &App{
-		client: service,
-		ssh:    sshRunner,
-		stdout: stdout,
-		stderr: stderr,
+		sshRunner:  sshRunner,
+		stdout:     stdout,
+		stderr:     stderr,
+		httpClient: httpClient,
 	}
 }
 
@@ -36,30 +44,138 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}
 
 	switch args[0] {
-	case "me":
-		return a.runMe(ctx, args[1:])
-	case "add":
-		return a.runAdd(ctx, args[1:])
-	case "ls", "list":
-		return a.runList(ctx, args[1:])
-	case "search":
-		return a.runSearch(ctx, args[1:])
-	case "ssh":
-		return a.runSSH(ctx, args[1:])
-	case "update":
-		return a.runUpdate(ctx, args[1:])
-	case "rm", "delete", "remove":
-		return a.runRemove(ctx, args[1:])
+	case "init":
+		return a.runInit(args[1:])
+	case "servers":
+		return a.runServers()
+	case "use":
+		return a.runUse(args[1:])
+	case "uninit":
+		return a.runUninit(args[1:])
 	case "help", "-h", "--help":
 		a.printUsage()
 		return nil
+	}
+
+	svc, err := a.getClient()
+	if err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "me":
+		return a.runMe(ctx, svc, args[1:])
+	case "add":
+		return a.runAdd(ctx, svc, args[1:])
+	case "ls", "list":
+		return a.runList(ctx, svc, args[1:])
+	case "search":
+		return a.runSearch(ctx, svc, args[1:])
+	case "ssh":
+		return a.runSSH(ctx, svc, args[1:])
+	case "update":
+		return a.runUpdate(ctx, svc, args[1:])
+	case "rm", "delete", "remove":
+		return a.runRemove(ctx, svc, args[1:])
 	default:
 		a.printUsage()
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func (a *App) runMe(ctx context.Context, args []string) error {
+func (a *App) getClient() (client.Service, error) {
+	if a.lazyClient != nil {
+		return a.lazyClient, nil
+	}
+
+	apiURL, err := config.ActiveURL()
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := client.NewHTTPClient(apiURL, a.httpClient)
+	if err != nil {
+		return nil, err
+	}
+	a.lazyClient = c
+	return c, nil
+}
+
+// --- init / servers / use / uninit ---
+
+func (a *App) runInit(args []string) error {
+	fs := a.newFlagSet("init")
+	var name string
+	fs.StringVar(&name, "name", "", "friendly name for this server (defaults to hostname)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: timmy init <server-url> [--name NAME]")
+	}
+
+	rawURL := fs.Arg(0)
+	if err := config.AddServer(name, rawURL); err != nil {
+		return err
+	}
+
+	store, err := config.LoadStore()
+	if err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(a.stdout, "Server added. %d server(s) configured, active: %s\n", len(store.Servers), store.Active)
+	return nil
+}
+
+func (a *App) runServers() error {
+	store, err := config.LoadStore()
+	if err != nil {
+		return err
+	}
+
+	if len(store.Servers) == 0 {
+		_, _ = fmt.Fprintln(a.stdout, "No servers configured. Run: timmy init <server-url>")
+		return nil
+	}
+
+	for _, s := range store.Servers {
+		marker := "  "
+		if s.Name == store.Active {
+			marker = "* "
+		}
+		_, _ = fmt.Fprintf(a.stdout, "%s%s  %s\n", marker, s.Name, s.URL)
+	}
+	return nil
+}
+
+func (a *App) runUse(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: timmy use <server-name>")
+	}
+	name := strings.TrimSpace(args[0])
+	if err := config.SetActive(name); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(a.stdout, "Switched to %s\n", name)
+	return nil
+}
+
+func (a *App) runUninit(args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: timmy uninit <server-name>")
+	}
+	name := strings.TrimSpace(args[0])
+	if err := config.RemoveServer(name); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(a.stdout, "Removed %s\n", name)
+	return nil
+}
+
+// --- commands that require an active server ---
+
+func (a *App) runMe(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("me")
 	var jsonOut bool
 	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
@@ -67,7 +183,7 @@ func (a *App) runMe(ctx context.Context, args []string) error {
 		return err
 	}
 
-	me, err := a.client.Me(ctx)
+	me, err := svc.Me(ctx)
 	if err != nil {
 		return err
 	}
@@ -78,7 +194,7 @@ func (a *App) runMe(ctx context.Context, args []string) error {
 	return a.renderMe(me)
 }
 
-func (a *App) runAdd(ctx context.Context, args []string) error {
+func (a *App) runAdd(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("add")
 	var (
 		name    string
@@ -100,7 +216,7 @@ func (a *App) runAdd(ctx context.Context, args []string) error {
 		return errors.New("add requires --name and --ip")
 	}
 
-	server, err := a.client.AddServer(ctx, client.CreateServerRequest{
+	server, err := svc.AddServer(ctx, client.CreateServerRequest{
 		Name:        name,
 		TailscaleIP: ip,
 		SSHUser:     sshUser,
@@ -116,7 +232,7 @@ func (a *App) runAdd(ctx context.Context, args []string) error {
 	return a.renderServers([]client.Server{server})
 }
 
-func (a *App) runList(ctx context.Context, args []string) error {
+func (a *App) runList(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("ls")
 	var (
 		tags    stringSliceFlag
@@ -131,7 +247,7 @@ func (a *App) runList(ctx context.Context, args []string) error {
 		return errors.New("ls does not accept positional arguments")
 	}
 
-	servers, err := a.client.ListServers(ctx, tags.Values())
+	servers, err := svc.ListServers(ctx, tags.Values())
 	if err != nil {
 		return err
 	}
@@ -142,7 +258,7 @@ func (a *App) runList(ctx context.Context, args []string) error {
 	return a.renderServers(servers)
 }
 
-func (a *App) runSearch(ctx context.Context, args []string) error {
+func (a *App) runSearch(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("search")
 	var (
 		tags    stringSliceFlag
@@ -159,7 +275,7 @@ func (a *App) runSearch(ctx context.Context, args []string) error {
 		return errors.New("search requires a single query argument")
 	}
 
-	servers, err := a.client.SearchServers(ctx, fs.Arg(0), tags.Values(), limit)
+	servers, err := svc.SearchServers(ctx, fs.Arg(0), tags.Values(), limit)
 	if err != nil {
 		return err
 	}
@@ -173,7 +289,7 @@ func (a *App) runSearch(ctx context.Context, args []string) error {
 	return a.renderServers(servers)
 }
 
-func (a *App) runSSH(ctx context.Context, args []string) error {
+func (a *App) runSSH(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("ssh")
 	var (
 		exact bool
@@ -188,15 +304,15 @@ func (a *App) runSSH(ctx context.Context, args []string) error {
 		return errors.New("ssh requires a single query argument")
 	}
 
-	server, err := a.resolveServerQuery(ctx, fs.Arg(0), exact, first)
+	server, err := a.resolveServerQuery(ctx, svc, fs.Arg(0), exact, first)
 	if err != nil {
 		return err
 	}
 
-	return a.ssh.Run(ctx, fmt.Sprintf("%s@%s", server.SSHUser, server.TailscaleIP))
+	return a.sshRunner.Run(ctx, fmt.Sprintf("%s@%s", server.SSHUser, server.TailscaleIP))
 }
 
-func (a *App) runUpdate(ctx context.Context, args []string) error {
+func (a *App) runUpdate(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("update")
 	var (
 		name      string
@@ -241,12 +357,12 @@ func (a *App) runUpdate(ctx context.Context, args []string) error {
 		return errors.New("update requires at least one field to change")
 	}
 
-	server, err := a.resolveServerQuery(ctx, fs.Arg(0), true, false)
+	server, err := a.resolveServerQuery(ctx, svc, fs.Arg(0), true, false)
 	if err != nil {
 		return err
 	}
 
-	updated, err := a.client.UpdateServer(ctx, server.ID, request)
+	updated, err := svc.UpdateServer(ctx, server.ID, request)
 	if err != nil {
 		return err
 	}
@@ -257,7 +373,7 @@ func (a *App) runUpdate(ctx context.Context, args []string) error {
 	return a.renderServers([]client.Server{updated})
 }
 
-func (a *App) runRemove(ctx context.Context, args []string) error {
+func (a *App) runRemove(ctx context.Context, svc client.Service, args []string) error {
 	fs := a.newFlagSet("rm")
 	var jsonOut bool
 	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
@@ -268,12 +384,12 @@ func (a *App) runRemove(ctx context.Context, args []string) error {
 		return errors.New("rm requires <id|query>")
 	}
 
-	server, err := a.resolveServerQuery(ctx, fs.Arg(0), true, false)
+	server, err := a.resolveServerQuery(ctx, svc, fs.Arg(0), true, false)
 	if err != nil {
 		return err
 	}
 
-	if err := a.client.DeleteServer(ctx, server.ID); err != nil {
+	if err := svc.DeleteServer(ctx, server.ID); err != nil {
 		return err
 	}
 
@@ -285,14 +401,16 @@ func (a *App) runRemove(ctx context.Context, args []string) error {
 	return err
 }
 
-func (a *App) resolveServerQuery(ctx context.Context, query string, exactOnly, allowFirst bool) (client.Server, error) {
+// --- helpers ---
+
+func (a *App) resolveServerQuery(ctx context.Context, svc client.Service, query string, exactOnly, allowFirst bool) (client.Server, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return client.Server{}, errors.New("query cannot be empty")
 	}
 
 	if id, err := strconv.ParseInt(query, 10, 64); err == nil && id > 0 {
-		servers, err := a.client.ListServers(ctx, nil)
+		servers, err := svc.ListServers(ctx, nil)
 		if err != nil {
 			return client.Server{}, err
 		}
@@ -304,7 +422,7 @@ func (a *App) resolveServerQuery(ctx context.Context, query string, exactOnly, a
 		return client.Server{}, fmt.Errorf("server %d not found", id)
 	}
 
-	servers, err := a.client.SearchServers(ctx, query, nil, 25)
+	servers, err := svc.SearchServers(ctx, query, nil, 25)
 	if err != nil {
 		return client.Server{}, err
 	}
@@ -381,6 +499,11 @@ func (a *App) newFlagSet(name string) *flag.FlagSet {
 
 func (a *App) printUsage() {
 	_, _ = fmt.Fprintln(a.stderr, `Usage:
+  timmy init <server-url> [--name NAME]   Register a timmy server
+  timmy servers                           List configured servers
+  timmy use <server-name>                 Switch active server
+  timmy uninit <server-name>              Remove a server
+
   timmy me [--json]
   timmy add --name NAME --ip TAILSCALE_IP [--user root] [--tag TAG]... [--json]
   timmy ls [--tag TAG]... [--json]
