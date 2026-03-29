@@ -64,7 +64,7 @@ For a public repository, users can download the matching archive from the latest
 For a private repository, the release workflow still works, but the assets are private too. Users need repository access and should download artifacts from the Releases page while signed in, or with the GitHub CLI:
 
 ```bash
-gh release download v0.1.0 --repo OWNER/REPO --pattern 'timmy_*_darwin_arm64.tar.gz'
+gh release download v0.1.0 --repo Carcraftz/timmy --pattern 'timmy_*_darwin_arm64.tar.gz'
 tar -xzf timmy_*_darwin_arm64.tar.gz
 chmod +x timmy
 mv timmy ~/.local/bin/timmy
