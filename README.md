@@ -55,6 +55,23 @@ flowchart LR
 - Tailscale installed and logged in
 - OpenSSH available locally
 
+## Installation
+
+Tagged releases publish prebuilt CLI archives for macOS, Linux, and Windows via GitHub Releases.
+
+For a public repository, users can download the matching archive from the latest release and place the `timmy` binary on their `PATH`.
+
+For a private repository, the release workflow still works, but the assets are private too. Users need repository access and should download artifacts from the Releases page while signed in, or with the GitHub CLI:
+
+```bash
+gh release download v0.1.0 --repo OWNER/REPO --pattern 'timmy_*_darwin_arm64.tar.gz'
+tar -xzf timmy_*_darwin_arm64.tar.gz
+chmod +x timmy
+mv timmy ~/.local/bin/timmy
+```
+
+`go install` is not currently the recommended install path for Timmy because the CLI module is not published under a fetchable public module path.
+
 ## Quickstart
 
 ### 1. Build the binaries
@@ -101,24 +118,32 @@ export TIMMY_LISTEN_ADDR=':18080'
 
 ### 4. Configure the CLI
 
-You can either export `TIMMY_API_URL`:
+Initialize the CLI with one or more Timmy servers:
 
 ```bash
-export TIMMY_API_URL='https://timmyd.your-tailnet.ts.net'
+./dist/timmy init https://timmyd.your-tailnet.ts.net --name prod
 ```
 
-Or create a config file at:
+You can add multiple backends:
 
-```text
-~/Library/Application Support/timmy/config.json
+```bash
+./dist/timmy init https://timmyd.team-a.ts.net --name team-a
+./dist/timmy init https://timmyd.team-b.ts.net --name team-b
+./dist/timmy servers
 ```
 
-Example:
+Switch the active backend for write operations:
 
-```json
-{
-  "api_url": "https://timmyd.your-tailnet.ts.net"
-}
+```bash
+./dist/timmy use team-a
+```
+
+`ls`, `search`, and `ssh` query all configured Timmy servers. `me`, `add`, `update`, and `rm` use the active server.
+
+If you need to target a single backend without touching saved config, `TIMMY_API_URL` still works as a one-off override:
+
+```bash
+TIMMY_API_URL='https://timmyd.your-tailnet.ts.net' ./dist/timmy me
 ```
 
 ### 5. Verify access
@@ -130,6 +155,11 @@ Example:
 ## CLI Usage
 
 ```bash
+timmy init <server-url> [--name NAME]
+timmy servers
+timmy use <server-name>
+timmy uninit <server-name>
+
 timmy me [--json]
 timmy add --name NAME --ip TAILSCALE_IP [--user root] [--tag TAG]... [--json]
 timmy ls [--tag TAG]... [--json]
@@ -138,6 +168,11 @@ timmy ssh QUERY [--exact] [--first]
 timmy update <id|query> [--name NAME] [--ip TAILSCALE_IP] [--user USER] [--tag TAG]... [--clear-tags] [--json]
 timmy rm <id|query> [--json]
 ```
+
+Notes:
+
+- `ls`, `search`, and `ssh` fan out across all initialized Timmy servers
+- `me`, `add`, `update`, and `rm` use the active server selected with `timmy use`
 
 ## Example Workflow
 
@@ -182,8 +217,8 @@ Connect over SSH:
 
 ### CLI configuration
 
-- `TIMMY_API_URL`: backend URL override
-- `TIMMY_CONFIG`: custom path to a JSON config file
+- `TIMMY_API_URL`: one-off backend URL override, useful for scripts or debugging
+- `TIMMY_CONFIG`: custom path to the CLI config file that stores initialized servers and the active selection
 
 ## Development
 
@@ -198,6 +233,15 @@ Build artifacts:
 ```bash
 make build-cli build-backend
 ```
+
+Publish a CLI release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Pushing a `v*` tag triggers GoReleaser and uploads release archives plus checksums to GitHub Releases.
 
 Stop local Postgres:
 
