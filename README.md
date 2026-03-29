@@ -262,4 +262,4 @@ Timmy is currently an MVP:
 
 Timmy is available under the MIT License. See `LICENSE`.
 
-If you want to contribute, start with `CONTRIBUTING.md`. If you need to report a security issue, see `SECURITY.md`.
+If you want to contribute, start with `CONTRIBUTING.md`.
