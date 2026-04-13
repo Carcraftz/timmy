@@ -228,6 +228,18 @@ func (a *App) runInit(args []string) error {
 	}
 
 	rawURL := fs.Arg(0)
+
+	// Validate server is reachable before adding to config
+	testClient, err := client.NewHTTPClient(rawURL, a.httpClient)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := testClient.Me(ctx); err != nil {
+		return fmt.Errorf("server %s is not reachable: %w", rawURL, err)
+	}
+
 	if err := config.AddServer(name, rawURL); err != nil {
 		return err
 	}
@@ -309,6 +321,10 @@ func (a *App) runList(ctx context.Context, args []string) error {
 	}
 
 	if jsonOut {
+		// Ensure we return empty array instead of null for JSON
+		if servers == nil {
+			servers = []client.Server{}
+		}
 		return a.writeJSON(map[string]any{"servers": servers})
 	}
 	return a.renderServers(servers)
@@ -337,6 +353,10 @@ func (a *App) runSearch(ctx context.Context, args []string) error {
 	}
 
 	if jsonOut {
+		// Ensure we return empty array instead of null for JSON
+		if servers == nil {
+			servers = []client.Server{}
+		}
 		return a.writeJSON(map[string]any{
 			"query":   fs.Arg(0),
 			"servers": servers,
@@ -428,6 +448,10 @@ func (a *App) runAdd(ctx context.Context, svc client.Service, args []string) err
 }
 
 func (a *App) runUpdate(ctx context.Context, svc client.Service, args []string) error {
+	// Reorder args: extract positional arg and put flags first
+	// This allows both "update 1 --tag foo" and "update --tag foo 1" to work
+	args = reorderArgsForFlags(args)
+
 	fs := a.newFlagSet("update")
 	var (
 		name      string
@@ -489,6 +513,9 @@ func (a *App) runUpdate(ctx context.Context, svc client.Service, args []string) 
 }
 
 func (a *App) runRemove(ctx context.Context, svc client.Service, args []string) error {
+	// Reorder args to handle "rm 1 --json" and "rm --json 1"
+	args = reorderArgsForFlags(args)
+
 	fs := a.newFlagSet("rm")
 	var jsonOut bool
 	fs.BoolVar(&jsonOut, "json", false, "print machine-readable output")
@@ -626,6 +653,42 @@ func exactServerMatchKind(query string, server client.Server) exactMatchKind {
 }
 
 // ---------- utilities ----------
+
+// reorderArgsForFlags reorders arguments so flags come before positional args.
+// This allows commands like "update 1 --tag foo" to work the same as "update --tag foo 1".
+// Go's flag package stops parsing at the first non-flag argument, so we need to
+// move positional arguments to the end.
+func reorderArgsForFlags(args []string) []string {
+	var flags []string
+	var positional []string
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			flags = append(flags, arg)
+			// Check if this flag takes a value (not a boolean flag)
+			// Flags like --tag, --name, --ip, --user take values
+			if !strings.Contains(arg, "=") && i+1 < len(args) {
+				// Peek at next arg - if it doesn't start with -, it's likely the value
+				next := args[i+1]
+				if !strings.HasPrefix(next, "-") {
+					// Check if this is a known boolean flag
+					flagName := strings.TrimLeft(arg, "-")
+					if flagName != "json" && flagName != "clear-tags" && flagName != "exact" && flagName != "first" {
+						flags = append(flags, next)
+						i++
+					}
+				}
+			}
+		} else {
+			positional = append(positional, arg)
+		}
+		i++
+	}
+
+	return append(flags, positional...)
+}
 
 func (a *App) newFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
